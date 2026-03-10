@@ -14,6 +14,7 @@ use governor::{
 };
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
+use chrono::Utc;
 
 use crate::backoff::WorkerBackoff;
 use crate::logging::mask_addr;
@@ -29,6 +30,19 @@ enum TransactionFetchOutcome {
 }
 
 type GlobalRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
+
+pub struct SignaturesPage {
+    pub response: RpcResponse,
+    pub last_signature: Option<String>,
+    pub raw_count: usize,
+    pub reached_cutoff: bool,
+}
+
+struct RecentSignaturesResult {
+    signatures: Vec<Signature>,
+    reached_cutoff: bool,
+    skipped_null_block_time: usize,
+}
 
 pub struct HeliusApi {
     api: String,
@@ -65,7 +79,8 @@ impl HeliusApi {
         &self,
         adress: &str,
         last_signature: Option<String>,
-    ) -> Result<(RpcResponse, Option<String>)> {
+        requested_hours: i16,
+    ) -> Result<SignaturesPage> {
         self.rate_limiter.until_ready().await;
         let _permit = self.semaphore.acquire().await?;
 
@@ -115,26 +130,34 @@ impl HeliusApi {
         let result = rpc_response
             .result
             .ok_or_else(|| anyhow!("missing result field in getSignaturesForAddress response"))?;
+        let raw_count = result.len();
+        let last_signature = result.last().map(|last| last.signature.clone());
+        let recent_signatures = take_recent_signatures(result, requested_hours);
+        let filtered_count = recent_signatures.signatures.len();
 
-        let dsrlz_response = RpcResponse { result };
-        let response_len = dsrlz_response.result.len();
         debug!(
             target: "client",
             status = ?status,
-            response_len,
+            raw_count,
+            filtered_count,
+            reached_cutoff = recent_signatures.reached_cutoff,
+            skipped_null_block_time = recent_signatures.skipped_null_block_time,
             elapsed_ms = request_started.elapsed().as_millis(),
             "Signatures response received"
         );
 
-        let last_signatures = dsrlz_response
-            .result
-            .last()
-            .map(|last| last.signature.clone());
-        if last_signatures.is_none() {
+        if last_signature.is_none() {
             warn!(target: "client", "Empty signatures response");
         }
 
-        Ok((dsrlz_response, last_signatures))
+        Ok(SignaturesPage {
+            response: RpcResponse {
+                result: recent_signatures.signatures,
+            },
+            last_signature,
+            raw_count,
+            reached_cutoff: recent_signatures.reached_cutoff,
+        })
     }
 
     #[instrument(target = "client", skip(self, signatures), fields(total = signatures.len()))]
@@ -444,5 +467,46 @@ impl HeliusApi {
         }
 
         snippet
+    }
+}
+
+fn take_recent_signatures(
+    signatures: Vec<Signature>,
+    requested_hours: i16
+) -> RecentSignaturesResult {
+    let cutoff_ts = Utc::now().timestamp() - i64::from(requested_hours.max(0)) * 3600;
+    let input_count = signatures.len();
+    let mut filtered = Vec::with_capacity(signatures.len());
+    let mut skipped_null_block_time = 0usize;
+    let mut reached_cutoff = false;
+
+    for sig in signatures {
+        match sig.block_time {
+            Some(ts) if ts >= cutoff_ts => filtered.push(sig),
+            Some(_) => {
+                reached_cutoff = true;
+                break;
+            }
+            None => {
+                skipped_null_block_time += 1;
+            }
+        }
+    }
+
+    debug!(
+        target: "client",
+        requested_hours,
+        cutoff_ts,
+        input_count,
+        filtered_count = filtered.len(),
+        skipped_null_block_time,
+        reached_cutoff,
+        "Filtered signatures by requested time window"
+    );
+
+    RecentSignaturesResult {
+        signatures: filtered,
+        reached_cutoff,
+        skipped_null_block_time,
     }
 }

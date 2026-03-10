@@ -90,7 +90,7 @@ async fn worker_loop(app_state: Arc<AppState>, worker_id: u32) -> Result<()> {
         let tx_limit = claimed_job.tx_limit;
 
         let processing_result: Result<()> = async {
-            fetching_signatures(&app_state, &address, tx_limit.to_usize().unwrap_or(1000)).await?;
+            fetching_signatures(&app_state, &address, tx_limit.to_usize().unwrap_or(1000), requested_hours).await?;
             fetched_unprocessed_signatures(&app_state, &address).await?;
             Ok(())
         }
@@ -135,7 +135,7 @@ async fn worker_loop(app_state: Arc<AppState>, worker_id: u32) -> Result<()> {
     }
 }
 
-async fn fetching_signatures(app_state: &AppState, address: &str, tx_limit: usize) -> Result<()> {
+async fn fetching_signatures(app_state: &AppState, address: &str, tx_limit: usize, requested_hours: i16) -> Result<()> {
     let database = &app_state.database;
     let helius_api = &app_state.helius_api;
     let masked_address = logging::mask_addr(address);
@@ -151,29 +151,37 @@ async fn fetching_signatures(app_state: &AppState, address: &str, tx_limit: usiz
             // Сбор всех подписей
             debug!(before = ?cur_last_signature, "Fetching signatures page");
             let page_started = Instant::now();
-            let (response, last_signature) = helius_api
-                .get_signatures(address, cur_last_signature)
+            let signatures_page = helius_api
+                .get_signatures(address, cur_last_signature, requested_hours)
                 .await?;
 
-            let res_len = response.result.len();
+            let res_len = signatures_page.response.result.len();
             sum += res_len;
 
             info!(
+                raw_page_len = signatures_page.raw_count,
                 page_len = res_len,
                 total = sum,
+                reached_cutoff = signatures_page.reached_cutoff,
                 elapsed_ms = page_started.elapsed().as_millis(),
                 "Signatures page received"
             );
 
-            let inserted = database.write_signatures(&response, address).await?;
+            let inserted = database
+                .write_signatures(&signatures_page.response, address)
+                .await?;
             debug!(inserted, "Signatures saved");
 
-            if last_signature.is_none() || res_len < 1000 || sum >= tx_limit {
+            if signatures_page.reached_cutoff
+                || signatures_page.last_signature.is_none()
+                || signatures_page.raw_count < 1000
+                || sum >= tx_limit
+            {
                 info!("No more signatures available");
                 break;
             }
 
-            cur_last_signature = last_signature;
+            cur_last_signature = signatures_page.last_signature;
         }
 
         info!(

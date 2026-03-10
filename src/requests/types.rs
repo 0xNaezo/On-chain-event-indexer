@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize, de::Deserializer};
+use serde::{Deserialize, de::Deserializer};
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::warn;
@@ -6,7 +6,7 @@ use tracing::warn;
 #[derive(Deserialize, Debug)]
 pub struct Signature {
     #[serde(rename = "blockTime")]
-    pub block_time: i64,
+    pub block_time: Option<i64>,
 
     pub signature: String,
 }

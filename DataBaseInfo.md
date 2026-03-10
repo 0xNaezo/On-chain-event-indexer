@@ -55,7 +55,7 @@
 
 | # | Имя колонки | Тип данных | Not Null | Значение по умолчанию |
 | :--- | :--- | :--- | :---: | :--- |
-| 1 | `block_time` | `int8` | [v] | |
+| 1 | `block_time` | `int8` | [ ] | |
 | 2 | `owner_address` | `text` | [v] | |
 | 7 | `signature` | `text` | [v] | |
 | 8 | `is_processed` | `bool` | [ ] | `false` |
