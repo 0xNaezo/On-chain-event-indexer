@@ -313,7 +313,7 @@ impl Database {
             WITH next_job AS (
                 SELECT id
                 FROM processing_data pd
-                WHERE status IN ('pending', 'indexing')
+                WHERE status = 'pending'
                 ORDER BY created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
