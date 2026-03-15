@@ -38,3 +38,11 @@ rand = "0.9"
 axum = "0.8" 
 tower-http = { version = "0.6.8", features = ["cors"] }
 nonzero_ext = "0.3"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
