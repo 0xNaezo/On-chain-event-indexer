@@ -63,6 +63,7 @@ pub struct HeliusApi {
     semaphore: Arc<Semaphore>,            // Ограничения одновременных запросов
     rate_limit_backoff: Arc<Mutex<WorkerBackoff>>,
     rate_limit_until: Arc<Mutex<Option<Instant>>>,
+    last_rate_limit_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl HeliusApi {
@@ -73,6 +74,7 @@ impl HeliusApi {
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
         let rate_limit_backoff = Arc::new(Mutex::new(WorkerBackoff::new(500, 10_000, 2.0)));
         let rate_limit_until = Arc::new(Mutex::new(None));
+        let last_rate_limit_at = Arc::new(Mutex::new(None));
 
         let api = dotenvy::var("api").expect("api не найден в .env");
         let client = Client::new();
@@ -86,6 +88,7 @@ impl HeliusApi {
             semaphore,
             rate_limit_backoff,
             rate_limit_until,
+            last_rate_limit_at,
         }
     }
 
@@ -231,7 +234,7 @@ impl HeliusApi {
                         .map(|signature| async move {
                             self.fetch_transaction_by_signature(signature).await
                         })
-                        .buffered(2)
+                        .buffered(1)
                         .collect::<Vec<_>>()
                         .await;
 
@@ -284,6 +287,9 @@ impl HeliusApi {
             }
             .instrument(chunk_span)
             .await;
+
+            // Small pause between chunks to avoid bursting into rate limits
+            sleep(Duration::from_millis(200)).await;
         }
 
         let mut total_transfers = 0usize;
@@ -544,6 +550,10 @@ impl HeliusApi {
             _ => *rate_limit_until = Some(until),
         }
 
+        // Track when we last saw a rate limit
+        let mut last_rl = self.last_rate_limit_at.lock().await;
+        *last_rl = Some(Instant::now());
+
         delay
     }
 
@@ -561,8 +571,20 @@ impl HeliusApi {
         };
 
         if !cooldown_active {
-            let mut backoff = self.rate_limit_backoff.lock().await;
-            backoff.reset();
+            // Only reset backoff if no rate limit was seen for at least 5 seconds;
+            // prevents premature reset when parallel workers get interleaved successes
+            let should_reset = {
+                let last_rl = self.last_rate_limit_at.lock().await;
+                match *last_rl {
+                    Some(at) => at.elapsed() > Duration::from_secs(5),
+                    None => true,
+                }
+            };
+
+            if should_reset {
+                let mut backoff = self.rate_limit_backoff.lock().await;
+                backoff.reset();
+            }
         }
     }
 
