@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
 
     let app_state = Arc::new(AppState {
         database: Database::new_pool().await?,
-        helius_api: HeliusApi::new(8, 4),
+        helius_api: HeliusApi::new(8, 2),
     });
 
     // Ловит запросы с фронта (запускаем в отдельной задаче, чтобы не блокировать воркеров)
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
 
 #[tracing::instrument(skip(app_state))]
 async fn worker_loop(app_state: Arc<AppState>, worker_id: u32) -> Result<()> {
-    let mut worker_backoff = WorkerBackoff::new(200, 2000, 0.5);
+    let mut worker_backoff = WorkerBackoff::new(200, 2000, 2.0);
     loop {
         let started = Instant::now();
         let claimed_job: ClaimedJob = loop {
@@ -90,7 +90,13 @@ async fn worker_loop(app_state: Arc<AppState>, worker_id: u32) -> Result<()> {
         let tx_limit = claimed_job.tx_limit;
 
         let processing_result: Result<()> = async {
-            fetching_signatures(&app_state, &address, tx_limit.to_usize().unwrap_or(1000), requested_hours).await?;
+            fetching_signatures(
+                &app_state,
+                &address,
+                tx_limit.to_usize().unwrap_or(1000),
+                requested_hours,
+            )
+            .await?;
             fetched_unprocessed_signatures(&app_state, &address).await?;
             Ok(())
         }
@@ -135,7 +141,12 @@ async fn worker_loop(app_state: Arc<AppState>, worker_id: u32) -> Result<()> {
     }
 }
 
-async fn fetching_signatures(app_state: &AppState, address: &str, tx_limit: usize, requested_hours: i16) -> Result<()> {
+async fn fetching_signatures(
+    app_state: &AppState,
+    address: &str,
+    tx_limit: usize,
+    requested_hours: i16,
+) -> Result<()> {
     let database = &app_state.database;
     let helius_api = &app_state.helius_api;
     let masked_address = logging::mask_addr(address);

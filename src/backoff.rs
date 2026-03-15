@@ -14,7 +14,7 @@ impl WorkerBackoff {
             min_delay: Duration::from_millis(min_ms),
             max_delay: Duration::from_millis(max_ms),
             current_delay: Duration::from_millis(min_ms),
-            multiplier,
+            multiplier: multiplier.max(1.0),
         }
     }
 

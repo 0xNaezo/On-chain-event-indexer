@@ -1,25 +1,36 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use chrono::Utc;
 use futures::{StreamExt, stream};
-use reqwest::Client;
-use serde_json::{Value, json};
-use tokio::time::sleep;
-use tracing::{Instrument, debug, info, instrument, warn};
 use governor::{
+    Quota, RateLimiter,
     clock::DefaultClock,
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
-    Quota, RateLimiter,
 };
+use reqwest::{
+    Client, StatusCode,
+    header::{HeaderMap, RETRY_AFTER},
+};
+use serde_json::{Value, json};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
-use chrono::Utc;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::sleep;
+use tracing::{Instrument, debug, info, instrument, warn};
 
 use crate::backoff::WorkerBackoff;
 use crate::logging::mask_addr;
 
 use super::types::*;
+
+const MAX_RATE_LIMIT_RETRIES: usize = 4;
+
+struct RpcHttpResponse {
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    body_text: String,
+}
 
 enum TransactionFetchOutcome {
     Success {
@@ -49,16 +60,19 @@ pub struct HeliusApi {
     url: String,
     client: Client,
     rate_limiter: Arc<GlobalRateLimiter>, // Лимитер RPS
-    semaphore: Arc<Semaphore>, // Ограничения одновременных запросов
+    semaphore: Arc<Semaphore>,            // Ограничения одновременных запросов
     rate_limit_backoff: Arc<Mutex<WorkerBackoff>>,
+    rate_limit_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl HeliusApi {
     pub fn new(rps: u32, max_concurrent: usize) -> Self {
-        let quota = Quota::per_second(std::num::NonZeroU32::new(rps).unwrap()); 
+        let quota = Quota::per_second(std::num::NonZeroU32::new(rps).unwrap())
+            .allow_burst(std::num::NonZeroU32::new(1).unwrap());
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
         let rate_limit_backoff = Arc::new(Mutex::new(WorkerBackoff::new(500, 10_000, 2.0)));
+        let rate_limit_until = Arc::new(Mutex::new(None));
 
         let api = dotenvy::var("api").expect("api не найден в .env");
         let client = Client::new();
@@ -71,6 +85,7 @@ impl HeliusApi {
             rate_limiter,
             semaphore,
             rate_limit_backoff,
+            rate_limit_until,
         }
     }
 
@@ -81,9 +96,6 @@ impl HeliusApi {
         last_signature: Option<String>,
         requested_hours: i16,
     ) -> Result<SignaturesPage> {
-        self.rate_limiter.until_ready().await;
-        let _permit = self.semaphore.acquire().await?;
-
         let body = json!({
             "jsonrpc": "2.0",
             "id": "1",
@@ -97,67 +109,103 @@ impl HeliusApi {
             ]
         });
 
-        let request_started = Instant::now();
-        let response = self
-            .client
-            .post(format!("{}{}", self.url, self.api))
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        let body_text = response.text().await?;
+        for attempt in 1..=MAX_RATE_LIMIT_RETRIES + 1 {
+            let request_started = Instant::now();
+            let response = self.send_rpc_request(&body).await?;
+            let status = response.status;
 
-        let rpc_response: RpcEnvelope<Vec<Signature>> =
-            serde_json::from_str(&body_text).map_err(|error| {
-                anyhow!(
-                    "failed to decode getSignaturesForAddress response: status={}, error={}",
+            let rpc_response: RpcEnvelope<Vec<Signature>> = match serde_json::from_str(
+                &response.body_text,
+            ) {
+                Ok(rpc_response) => rpc_response,
+                Err(error) => {
+                    if status == StatusCode::TOO_MANY_REQUESTS && attempt <= MAX_RATE_LIMIT_RETRIES
+                    {
+                        let delay = self.register_rate_limit(response.retry_after).await;
+                        warn!(
+                            target: "client",
+                            address = %mask_addr(adress),
+                            status = ?status,
+                            attempt,
+                            max_attempts = MAX_RATE_LIMIT_RETRIES + 1,
+                            sleep_ms = delay.as_millis(),
+                            "Rate limit detected on getSignaturesForAddress, retrying"
+                        );
+                        continue;
+                    }
+
+                    return Err(anyhow!(
+                        "failed to decode getSignaturesForAddress response: status={}, error={}",
+                        status,
+                        error
+                    ));
+                }
+            };
+
+            if let Some(rpc_error) = rpc_response.error {
+                if rpc_error.is_rate_limited() && attempt <= MAX_RATE_LIMIT_RETRIES {
+                    let delay = self.register_rate_limit(response.retry_after).await;
+                    warn!(
+                        target: "client",
+                        address = %mask_addr(adress),
+                        status = ?status,
+                        rpc_code = rpc_error.code,
+                        attempt,
+                        max_attempts = MAX_RATE_LIMIT_RETRIES + 1,
+                        sleep_ms = delay.as_millis(),
+                        "Rate limit detected on getSignaturesForAddress, retrying"
+                    );
+                    continue;
+                }
+
+                return Err(anyhow!(
+                    "rpc error on getSignaturesForAddress: status={}, code={}, message={}, rate_limited={}",
                     status,
-                    error
-                )
+                    rpc_error.code,
+                    rpc_error.message,
+                    rpc_error.is_rate_limited()
+                ));
+            }
+
+            let result = rpc_response.result.ok_or_else(|| {
+                anyhow!("missing result field in getSignaturesForAddress response")
             })?;
+            let raw_count = result.len();
+            let last_signature = result.last().map(|last| last.signature.clone());
+            let recent_signatures = take_recent_signatures(result, requested_hours);
+            let filtered_count = recent_signatures.signatures.len();
 
-        if let Some(rpc_error) = rpc_response.error {
-            let rate_limited = rpc_error.is_rate_limited();
-            return Err(anyhow!(
-                "rpc error on getSignaturesForAddress: status={}, code={}, message={}, rate_limited={}",
-                status,
-                rpc_error.code,
-                rpc_error.message,
-                rate_limited
-            ));
+            debug!(
+                target: "client",
+                status = ?status,
+                raw_count,
+                filtered_count,
+                reached_cutoff = recent_signatures.reached_cutoff,
+                skipped_null_block_time = recent_signatures.skipped_null_block_time,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                "Signatures response received"
+            );
+
+            self.reset_rate_limit_backoff_if_idle().await;
+
+            if last_signature.is_none() {
+                warn!(target: "client", "Empty signatures response");
+            }
+
+            return Ok(SignaturesPage {
+                response: RpcResponse {
+                    result: recent_signatures.signatures,
+                },
+                last_signature,
+                raw_count,
+                reached_cutoff: recent_signatures.reached_cutoff,
+            });
         }
 
-        let result = rpc_response
-            .result
-            .ok_or_else(|| anyhow!("missing result field in getSignaturesForAddress response"))?;
-        let raw_count = result.len();
-        let last_signature = result.last().map(|last| last.signature.clone());
-        let recent_signatures = take_recent_signatures(result, requested_hours);
-        let filtered_count = recent_signatures.signatures.len();
-
-        debug!(
-            target: "client",
-            status = ?status,
-            raw_count,
-            filtered_count,
-            reached_cutoff = recent_signatures.reached_cutoff,
-            skipped_null_block_time = recent_signatures.skipped_null_block_time,
-            elapsed_ms = request_started.elapsed().as_millis(),
-            "Signatures response received"
-        );
-
-        if last_signature.is_none() {
-            warn!(target: "client", "Empty signatures response");
-        }
-
-        Ok(SignaturesPage {
-            response: RpcResponse {
-                result: recent_signatures.signatures,
-            },
-            last_signature,
-            raw_count,
-            reached_cutoff: recent_signatures.reached_cutoff,
-        })
+        Err(anyhow!(
+            "getSignaturesForAddress exhausted retry budget after {} attempts",
+            MAX_RATE_LIMIT_RETRIES + 1
+        ))
     }
 
     #[instrument(target = "client", skip(self, signatures), fields(total = signatures.len()))]
@@ -178,13 +226,14 @@ impl HeliusApi {
                 let chunk_started = Instant::now();
                 debug!(target: "client", "Fetching transaction chunk");
 
-                let chunk_responses = stream::iter(signatures.iter().cloned())
-                    .map(|signature| async move {
-                        self.fetch_transaction_by_signature(signature).await
-                    })
-                    .buffered(3)
-                    .collect::<Vec<_>>()
-                    .await;
+                let chunk_responses =
+                    stream::iter(signatures.iter().cloned())
+                        .map(|signature| async move {
+                            self.fetch_transaction_by_signature(signature).await
+                        })
+                        .buffered(2)
+                        .collect::<Vec<_>>()
+                        .await;
 
                 let mut chunk_success = 0usize;
                 let mut chunk_failed = 0usize;
@@ -273,45 +322,7 @@ impl HeliusApi {
         })
     }
 
-    async fn failed_with_rate_limit_sleep(
-        &self,
-        error: TransactionFetchError,
-    ) -> TransactionFetchOutcome {
-        if error.is_rate_limited() {
-            let delay = {
-                let mut backoff = self.rate_limit_backoff.lock().await;
-                backoff.step_and_get_sleep_duration()
-            };
-            warn!(
-                target: "client",
-                signature = %mask_addr(&error.signature),
-                status_code = ?error.status_code,
-                rpc_code = ?error.rpc_code,
-                sleep_ms = delay.as_millis(),
-                "Rate limit detected, sleeping after 429"
-            );
-            sleep(delay).await;
-        }
-
-        TransactionFetchOutcome::Failed(error)
-    }
-
     async fn fetch_transaction_by_signature(&self, signature: String) -> TransactionFetchOutcome {
-        self.rate_limiter.until_ready().await;
-        let _permit = match self.semaphore.acquire().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                return self
-                    .failed_with_rate_limit_sleep(TransactionFetchError {
-                        signature,
-                        status_code: None,
-                        rpc_code: None,
-                        message: format!("failed to acquire semaphore permit: {}", error),
-                    })
-                    .await;
-            }
-        };
-
         let body = json!({
             "jsonrpc": "2.0",
             "id": "1",
@@ -325,129 +336,241 @@ impl HeliusApi {
             ]
         });
 
-        let request_started = Instant::now();
-        let response = match self
-            .client
-            .post(format!("{}{}", self.url, self.api))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                return self
-                    .failed_with_rate_limit_sleep(TransactionFetchError {
+        let mut last_rate_limit_error: Option<TransactionFetchError> = None;
+
+        for attempt in 1..=MAX_RATE_LIMIT_RETRIES + 1 {
+            let request_started = Instant::now();
+            let response = match self.send_rpc_request(&body).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return TransactionFetchOutcome::Failed(TransactionFetchError {
                         signature,
                         status_code: None,
                         rpc_code: None,
                         message: format!("request failed: {}", error),
-                    })
-                    .await;
-            }
-        };
+                    });
+                }
+            };
 
-        let status = response.status();
-        let body_text = match response.text().await {
-            Ok(body_text) => body_text,
-            Err(error) => {
-                return self
-                    .failed_with_rate_limit_sleep(TransactionFetchError {
-                        signature,
-                        status_code: Some(status.as_u16()),
-                        rpc_code: None,
-                        message: format!("failed to read response body: {}", error),
-                    })
-                    .await;
-            }
-        };
-
-        let rpc_response: RpcEnvelope<Value> = match serde_json::from_str(&body_text) {
-            Ok(rpc_response) => rpc_response,
-            Err(error) => {
-                return self
-                    .failed_with_rate_limit_sleep(TransactionFetchError {
-                        signature,
+            let status = response.status;
+            let rpc_response: RpcEnvelope<Value> = match serde_json::from_str(&response.body_text) {
+                Ok(rpc_response) => rpc_response,
+                Err(error) => {
+                    let fetch_error = TransactionFetchError {
+                        signature: signature.clone(),
                         status_code: Some(status.as_u16()),
                         rpc_code: None,
                         message: format!(
                             "failed to decode rpc envelope: {}; body={}",
                             error,
-                            Self::body_snippet(&body_text)
+                            Self::body_snippet(&response.body_text)
                         ),
-                    })
-                    .await;
-            }
-        };
+                    };
 
-        if let Some(rpc_error) = rpc_response.error {
-            return self
-                .failed_with_rate_limit_sleep(TransactionFetchError {
-                    signature,
+                    if fetch_error.is_rate_limited() && attempt <= MAX_RATE_LIMIT_RETRIES {
+                        last_rate_limit_error = Some(fetch_error.clone());
+                        let delay = self.register_rate_limit(response.retry_after).await;
+                        warn!(
+                            target: "client",
+                            signature = %mask_addr(&signature),
+                            status_code = ?fetch_error.status_code,
+                            rpc_code = ?fetch_error.rpc_code,
+                            attempt,
+                            max_attempts = MAX_RATE_LIMIT_RETRIES + 1,
+                            sleep_ms = delay.as_millis(),
+                            "Rate limit detected on getTransaction, retrying"
+                        );
+                        continue;
+                    }
+
+                    return TransactionFetchOutcome::Failed(fetch_error);
+                }
+            };
+
+            if let Some(rpc_error) = rpc_response.error {
+                let fetch_error = TransactionFetchError {
+                    signature: signature.clone(),
                     status_code: Some(status.as_u16()),
                     rpc_code: Some(rpc_error.code),
                     message: rpc_error.message,
-                })
-                .await;
-        }
+                };
 
-        let result_value = match rpc_response.result {
-            Some(value) => value,
-            None => {
-                return self
-                    .failed_with_rate_limit_sleep(TransactionFetchError {
+                if fetch_error.is_rate_limited() && attempt <= MAX_RATE_LIMIT_RETRIES {
+                    last_rate_limit_error = Some(fetch_error.clone());
+                    let delay = self.register_rate_limit(response.retry_after).await;
+                    warn!(
+                        target: "client",
+                        signature = %mask_addr(&signature),
+                        status_code = ?fetch_error.status_code,
+                        rpc_code = ?fetch_error.rpc_code,
+                        attempt,
+                        max_attempts = MAX_RATE_LIMIT_RETRIES + 1,
+                        sleep_ms = delay.as_millis(),
+                        "Rate limit detected on getTransaction, retrying"
+                    );
+                    continue;
+                }
+
+                return TransactionFetchOutcome::Failed(fetch_error);
+            }
+
+            let result_value = match rpc_response.result {
+                Some(value) => value,
+                None => {
+                    return TransactionFetchOutcome::Failed(TransactionFetchError {
                         signature,
                         status_code: Some(status.as_u16()),
                         rpc_code: None,
                         message: String::from("missing result field in rpc response"),
-                    })
-                    .await;
-            }
-        };
+                    });
+                }
+            };
 
-        if result_value.is_null() {
-            return self
-                .failed_with_rate_limit_sleep(TransactionFetchError {
+            if result_value.is_null() {
+                return TransactionFetchOutcome::Failed(TransactionFetchError {
                     signature,
                     status_code: Some(status.as_u16()),
                     rpc_code: None,
                     message: String::from("rpc result is null"),
-                })
-                .await;
-        }
+                });
+            }
 
-        let tx_info: TransactionInfo = match serde_json::from_value(result_value) {
-            Ok(tx_info) => tx_info,
-            Err(error) => {
-                return self
-                    .failed_with_rate_limit_sleep(TransactionFetchError {
+            let tx_info: TransactionInfo = match serde_json::from_value(result_value) {
+                Ok(tx_info) => tx_info,
+                Err(error) => {
+                    return TransactionFetchOutcome::Failed(TransactionFetchError {
                         signature,
                         status_code: Some(status.as_u16()),
                         rpc_code: None,
                         message: format!("failed to decode transaction result: {}", error),
-                    })
-                    .await;
+                    });
+                }
+            };
+
+            debug!(
+                target: "client",
+                status = ?status,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                "Transaction response received"
+            );
+            self.reset_rate_limit_backoff_if_idle().await;
+
+            return TransactionFetchOutcome::Success {
+                signature,
+                transaction: TransactionResult {
+                    result: tx_info,
+                    vec_transfers: Vec::new(),
+                    token_transfer_changes: Vec::new(),
+                },
+            };
+        }
+
+        TransactionFetchOutcome::Failed(last_rate_limit_error.unwrap_or(TransactionFetchError {
+            signature,
+            status_code: None,
+            rpc_code: None,
+            message: format!(
+                "getTransaction exhausted retry budget after {} attempts",
+                MAX_RATE_LIMIT_RETRIES + 1
+            ),
+        }))
+    }
+
+    async fn send_rpc_request(&self, body: &Value) -> Result<RpcHttpResponse> {
+        let _permit = self.acquire_request_slot().await?;
+        let response = self
+            .client
+            .post(format!("{}{}", self.url, self.api))
+            .json(body)
+            .send()
+            .await?;
+        let status = response.status();
+        let retry_after = Self::parse_retry_after(response.headers());
+        let body_text = response.text().await?;
+
+        Ok(RpcHttpResponse {
+            status,
+            retry_after,
+            body_text,
+        })
+    }
+
+    async fn acquire_request_slot(&self) -> Result<OwnedSemaphorePermit> {
+        self.wait_for_rate_limit_cooldown().await;
+        let permit = self.semaphore.clone().acquire_owned().await?;
+        self.wait_for_rate_limit_cooldown().await;
+        self.rate_limiter.until_ready().await;
+        Ok(permit)
+    }
+
+    async fn wait_for_rate_limit_cooldown(&self) {
+        loop {
+            let delay = {
+                let mut rate_limit_until = self.rate_limit_until.lock().await;
+                match *rate_limit_until {
+                    Some(until) if until > Instant::now() => {
+                        Some(until.duration_since(Instant::now()))
+                    }
+                    Some(_) => {
+                        *rate_limit_until = None;
+                        None
+                    }
+                    None => None,
+                }
+            };
+
+            match delay {
+                Some(delay) => sleep(delay).await,
+                None => break,
+            }
+        }
+    }
+
+    async fn register_rate_limit(&self, retry_after: Option<Duration>) -> Duration {
+        let delay = match retry_after.filter(|delay| !delay.is_zero()) {
+            Some(delay) => delay,
+            None => {
+                let mut backoff = self.rate_limit_backoff.lock().await;
+                backoff.step_and_get_sleep_duration()
+            }
+        };
+        let until = Instant::now()
+            .checked_add(delay)
+            .unwrap_or_else(Instant::now);
+
+        let mut rate_limit_until = self.rate_limit_until.lock().await;
+        match *rate_limit_until {
+            Some(current_until) if current_until >= until => {}
+            _ => *rate_limit_until = Some(until),
+        }
+
+        delay
+    }
+
+    async fn reset_rate_limit_backoff_if_idle(&self) {
+        let cooldown_active = {
+            let mut rate_limit_until = self.rate_limit_until.lock().await;
+            match *rate_limit_until {
+                Some(until) if until > Instant::now() => true,
+                Some(_) => {
+                    *rate_limit_until = None;
+                    false
+                }
+                None => false,
             }
         };
 
-        debug!(
-            target: "client",
-            status = ?status,
-            elapsed_ms = request_started.elapsed().as_millis(),
-            "Transaction response received"
-        );
-        {
+        if !cooldown_active {
             let mut backoff = self.rate_limit_backoff.lock().await;
             backoff.reset();
         }
+    }
 
-        TransactionFetchOutcome::Success {
-            signature,
-            transaction: TransactionResult {
-                result: tx_info,
-                vec_transfers: Vec::new(),
-                token_transfer_changes: Vec::new(),
-            },
-        }
+    fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+        let value = headers.get(RETRY_AFTER)?;
+        let value = value.to_str().ok()?.trim();
+        let seconds = value.parse::<u64>().ok()?;
+        Some(Duration::from_secs(seconds))
     }
 
     fn body_snippet(body: &str) -> String {
@@ -472,7 +595,7 @@ impl HeliusApi {
 
 fn take_recent_signatures(
     signatures: Vec<Signature>,
-    requested_hours: i16
+    requested_hours: i16,
 ) -> RecentSignaturesResult {
     let cutoff_ts = Utc::now().timestamp() - i64::from(requested_hours.max(0)) * 3600;
     let input_count = signatures.len();
