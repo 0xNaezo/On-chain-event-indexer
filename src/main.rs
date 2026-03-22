@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
 
 #[tracing::instrument(skip(app_state))]
 async fn worker_loop(app_state: Arc<AppState>, worker_id: u32) -> Result<()> {
-    let mut worker_backoff = WorkerBackoff::new(200, 2000, 2.0);
+    let mut worker_backoff = WorkerBackoff::new(200.0, 2000.0, 2.0);
     loop {
         let started = Instant::now();
         let claimed_job: ClaimedJob = loop {
