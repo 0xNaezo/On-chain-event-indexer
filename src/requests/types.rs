@@ -391,112 +391,7 @@ impl TransactionResult {
             || program == Some("spl-token")
             || program == Some("spl-token-2022");
 
-        let (asset_type, token_program) = if is_spl {
-            (String::from("spl"), program_id.map(str::to_string))
-        } else if is_system {
-            (String::from("native"), None)
-        } else {
-            return; // Игнорируем неизвестные программы
-        };
-
-        let info = &parsed.info;
-
-        // 4. Извлекаем количество, decimals и mint в зависимости от типа актива
-        let (amount_raw, mut amount_ui, mut decimals, mut token_mint) = if asset_type == "native" {
-            let lamports = match info.lamports {
-                Some(lamports) => lamports,
-                None => return,
-            };
-            (
-                lamports as i128,
-                Some(lamports as f64 / 1_000_000_000f64),
-                Some(9),
-                None,
-            )
-        } else if let Some(token_amount) = &info.token_amount {
-            // Вариант 1: передана структура tokenAmount (часто в transferChecked)
-            let amount_raw = match token_amount.amount.parse::<i128>() {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            (
-                amount_raw,
-                token_amount.ui_amount,
-                Some(token_amount.decimals),
-                info.mint.clone(),
-            )
-        } else if let Some(amount_str) = &info.amount {
-            // Вариант 2: передана строка amount (обычный transfer)
-            let amount_raw = match amount_str.parse::<i128>() {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            (amount_raw, info.ui_amount, info.decimals, info.mint.clone())
-        } else {
-            return;
-        };
-
-        // 5. Определяем отправителя и получателя
-        // Откуда → куда: для SPL берём token-accounts, для native — кошельки
-        let (source_token_account, destination_token_account, source_owner, destination_owner) =
-            if asset_type == "native" {
-                (None, None, info.source.clone(), info.destination.clone())
-            } else {
-                let mut source = info.source.clone();
-                let mut destination = info.destination.clone();
-
-                // Корректируем логику для mint/burn, где source/dest могут называться иначе (account)
-                if transfer_type_raw.starts_with("mint") {
-                    destination = info.account.clone().or(destination);
-                }
-                if transfer_type_raw.starts_with("burn") {
-                    source = info.account.clone().or(source);
-                }
-
-                // Пытаемся найти владельцев (owner) через lookup таблицу метаданных (token_account_meta)
-                let source_owner = source
-                    .as_ref()
-                    .and_then(|addr| token_account_meta.get(addr).map(|m| m.owner.clone()));
-                let destination_owner = destination
-                    .as_ref()
-                    .and_then(|addr| token_account_meta.get(addr).map(|m| m.owner.clone()));
-
-                // Дозаполняем mint, если не нашли ранее
-                if token_mint.is_none() {
-                    token_mint = source
-                        .as_ref()
-                        .and_then(|addr| token_account_meta.get(addr).map(|m| m.mint.clone()))
-                        .or_else(|| {
-                            destination.as_ref().and_then(|addr| {
-                                token_account_meta.get(addr).map(|m| m.mint.clone())
-                            })
-                        });
-                }
-
-                // Дозаполняем decimals, если не нашли ранее
-                if decimals.is_none() {
-                    decimals = source
-                        .as_ref()
-                        .and_then(|addr| token_account_meta.get(addr).map(|m| m.decimals))
-                        .or_else(|| {
-                            destination
-                                .as_ref()
-                                .and_then(|addr| token_account_meta.get(addr).map(|m| m.decimals))
-                        });
-                }
-
-                // Если есть decimals, но нет UI amount — считаем сами
-                if amount_ui.is_none() {
-                    if let Some(decimals) = decimals {
-                        amount_ui = Some((amount_raw as f64) / 10f64.powi(decimals as i32));
-                    }
-                }
-
-                (source, destination, source_owner, destination_owner)
-            };
-
-        // 6. Нормализуем тип трансфера
-        let transfer_type = match transfer_type_raw {
+        let normalized_transfer_type = match transfer_type_raw {
             "transfer" | "transferChecked" => "transfer",
             "mintTo" | "mintToChecked" => "mint",
             "burn" | "burnChecked" => "burn",
@@ -504,24 +399,154 @@ impl TransactionResult {
         }
         .to_string();
 
-        // 7. Сохраняем результат
-        out.push(TokenTransferChange {
-            token_mint,
-            token_program,
-            source_owner,
-            destination_owner,
-            source_token_account,
-            destination_token_account,
-            amount_raw,
-            amount_ui,
-            decimals,
+        let transfer_change = if is_spl {
+            Self::parse_spl_transfer(
+                &parsed.info,
+                normalized_transfer_type,
+                program_id,
+                token_account_meta,
+                instruction_idx,
+                inner_idx,
+            )
+        } else if is_system {
+            Self::parse_native_transfer(
+                &parsed.info,
+                normalized_transfer_type,
+                instruction_idx,
+                inner_idx,
+            )
+        } else {
+            None
+        };
+
+        if let Some(change) = transfer_change {
+            out.push(change);
+        }
+    }
+
+    fn parse_native_transfer(
+        info: &ParsedInfo,
+        transfer_type: String,
+        instruction_idx: i32,
+        inner_idx: Option<i32>,
+    ) -> Option<TokenTransferChange> {
+        let lamports = info.lamports?;
+
+        let high = u32::try_from(lamports >> 32).unwrap_or(0);
+        let low = u32::try_from(lamports & 0xFFFF_FFFF).unwrap_or(0);
+        let as_f64 = f64::from(high) * 4_294_967_296.0 + f64::from(low);
+
+        Some(TokenTransferChange {
+            token_mint: None,
+            token_program: None,
+            source_owner: info.source.clone(),
+            destination_owner: info.destination.clone(),
+            source_token_account: None,
+            destination_token_account: None,
+            amount_raw: i128::from(lamports),
+            amount_ui: Some(as_f64 / 1_000_000_000.0),
+            decimals: Some(9),
             transfer_type,
-            asset_type,
+            asset_type: String::from("native"),
             direction: String::from("unknown"),
             authority: info.authority.clone(),
             instruction_idx: Some(instruction_idx),
             inner_idx,
-        });
+        })
+    }
+
+    fn parse_spl_transfer(
+        info: &ParsedInfo,
+        transfer_type: String,
+        program_id: Option<&str>,
+        token_account_meta: &HashMap<String, TokenAccountMeta>,
+        instruction_idx: i32,
+        inner_idx: Option<i32>,
+    ) -> Option<TokenTransferChange> {
+        let (amount_raw, mut amount_ui, mut decimals, mut token_mint) =
+            if let Some(token_amount) = &info.token_amount {
+                let Ok(amount_raw) = token_amount.amount.parse::<i128>() else {
+                    return None;
+                };
+                (
+                    amount_raw,
+                    token_amount.ui_amount,
+                    Some(token_amount.decimals),
+                    info.mint.clone(),
+                )
+            } else if let Some(amount_str) = &info.amount {
+                let Ok(amount_raw) = amount_str.parse::<i128>() else {
+                    return None;
+                };
+                (amount_raw, info.ui_amount, info.decimals, info.mint.clone())
+            } else {
+                return None;
+            };
+
+        let mut source = info.source.clone();
+        let mut destination = info.destination.clone();
+
+        if transfer_type == "mint" {
+            destination = info.account.clone().or(destination);
+        }
+        if transfer_type == "burn" {
+            source = info.account.clone().or(source);
+        }
+
+        let source_owner = source
+            .as_ref()
+            .and_then(|addr| token_account_meta.get(addr).map(|m| m.owner.clone()));
+        let destination_owner = destination
+            .as_ref()
+            .and_then(|addr| token_account_meta.get(addr).map(|m| m.owner.clone()));
+
+        if token_mint.is_none() {
+            token_mint = source
+                .as_ref()
+                .and_then(|addr| token_account_meta.get(addr).map(|m| m.mint.clone()))
+                .or_else(|| {
+                    destination
+                        .as_ref()
+                        .and_then(|addr| token_account_meta.get(addr).map(|m| m.mint.clone()))
+                });
+        }
+
+        if decimals.is_none() {
+            decimals = source
+                .as_ref()
+                .and_then(|addr| token_account_meta.get(addr).map(|m| m.decimals))
+                .or_else(|| {
+                    destination
+                        .as_ref()
+                        .and_then(|addr| token_account_meta.get(addr).map(|m| m.decimals))
+                });
+        }
+
+        if amount_ui.is_none()
+            && let Some(decimals) = decimals
+        {
+            #[allow(clippy::cast_precision_loss)] // for display purposes only
+            let amount_f64 = amount_raw as f64;
+            amount_ui = Some(amount_f64 / 10f64.powi(i32::from(decimals)));
+        }
+
+        Some(TokenTransferChange {
+            token_mint,
+            token_program: program_id.map(str::to_string),
+            source_owner,
+            destination_owner,
+            source_token_account: source,
+            destination_token_account: destination,
+            amount_raw,
+            amount_ui,
+            decimals,
+            transfer_type,
+            asset_type: String::from("spl"),
+            direction: String::from("unknown"),
+            authority: info.authority.clone(),
+            instruction_idx: Some(instruction_idx),
+            inner_idx,
+        })
     }
 
     /// Быстрый маппинг token-account -> {owner, mint, decimals} из pre/post балансов.
