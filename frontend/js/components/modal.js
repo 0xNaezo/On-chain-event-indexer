@@ -111,16 +111,25 @@ export function initModal() {
             const processedTransactions = jobInfo.processed_transactions ?? 0;
             const remainingTransactions = jobInfo.remaining_transactions ?? 0;
             const nextStatus = jobInfo.status;
-            const previousProcessedTransactions = currentItem.processedTransactions ?? 0;
             const previousSpeedPerSecond = currentItem.speedPerSecond ?? 0;
             const hadIndexingStarted = Boolean(currentItem.indexingStartedAt);
-            const hasPollingBaseline = Boolean(currentItem.lastPolledAt);
+            let progressHistory = currentItem.progressHistory ? [...currentItem.progressHistory] : [];
 
             let speedPerSecond = 0;
 
-            if ((nextStatus === 'indexing' || nextStatus === 'ready') && hasPollingBaseline) {
-                const processedDelta = Math.max(processedTransactions - previousProcessedTransactions, 0);
-                speedPerSecond = processedDelta / (POLL_INTERVAL_MS / 1000);
+            if (nextStatus === 'indexing' || nextStatus === 'ready') {
+                progressHistory.push({ time: now, processed: processedTransactions });
+                if (progressHistory.length > 5) {
+                    progressHistory.shift();
+                }
+
+                if (progressHistory.length > 1) {
+                    const oldest = progressHistory[0];
+                    const newest = progressHistory[progressHistory.length - 1];
+                    const timeDiffSeconds = Math.max((newest.time - oldest.time) / 1000, 1);
+                    const processedDelta = Math.max(newest.processed - oldest.processed, 0);
+                    speedPerSecond = processedDelta / timeDiffSeconds;
+                }
             }
 
             if ((nextStatus === 'ready' || nextStatus === 'error') && speedPerSecond === 0) {
@@ -135,7 +144,8 @@ export function initModal() {
                 remainingTransactions,
                 updatedAt: jobInfo.updated_at ?? null,
                 lastPolledAt: now,
-                speedPerSecond
+                speedPerSecond,
+                progressHistory
             };
 
             if (nextStatus === 'indexing' && !hadIndexingStarted) {
@@ -209,7 +219,8 @@ export function initModal() {
                 indexingStartedAt: null,
                 finishedAt: null,
                 lastPolledAt: null,
-                speedPerSecond: 0
+                speedPerSecond: 0,
+                progressHistory: []
             });
             renderSidebar();
             renderMainArea();

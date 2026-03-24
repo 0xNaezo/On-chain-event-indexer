@@ -37,6 +37,7 @@ export const actions = {
                 finishedAt: null,
                 lastPolledAt: null,
                 speedPerSecond: 0,
+                progressHistory: [],
                 ...patch
             });
         }
