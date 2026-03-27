@@ -1,5 +1,5 @@
 import { state, actions } from '../state.js';
-import { isAddressLike, validateSolanaAddress, submitAnalyzeRequest, fetchJobInfo } from '../api.js';
+import { isAddressLike, validateSolanaAddress, submitAnalyzeRequest, fetchJobInfo, fetchJobCharts } from '../api.js';
 import { renderSidebar } from './sidebar.js';
 import { renderMainArea } from './mainArea.js';
 import { showGlobalToast, showStatus } from '../utils.js';
@@ -97,6 +97,44 @@ export function initModal() {
         actions.clearPollingInterval(address);
     };
 
+    const syncCharts = async (address, jobId) => {
+        const currentItem = state.addresses.find(item => item.address === address);
+        if (!currentItem || !jobId) {
+            return;
+        }
+
+        if (currentItem.chartsStatus === 'loading' || currentItem.chartsStatus === 'loaded') {
+            return;
+        }
+
+        actions.addOrUpdateAddress(address, {
+            chartsStatus: 'loading',
+            chartsError: null
+        });
+
+        try {
+            const charts = await fetchJobCharts(jobId);
+            const nextItem = state.addresses.find(item => item.address === address);
+            if (!nextItem) {
+                return;
+            }
+
+            actions.addOrUpdateAddress(address, {
+                charts,
+                chartsStatus: 'loaded',
+                chartsError: null,
+                chartsFetchedAt: Date.now()
+            });
+            renderMainArea();
+        } catch (error) {
+            console.error('Charts loading error:', error);
+            actions.addOrUpdateAddress(address, {
+                chartsStatus: 'error',
+                chartsError: error.message || 'Failed to fetch charts'
+            });
+        }
+    };
+
     const syncJobInfo = async (address, jobId) => {
         const currentItem = state.addresses.find(item => item.address === address);
         if (!currentItem) {
@@ -169,6 +207,10 @@ export function initModal() {
             if (nextStatus === 'ready' || nextStatus === 'error') {
                 stopPolling(address);
             }
+
+            if (nextStatus === 'ready') {
+                void syncCharts(address, jobId);
+            }
         } catch (error) {
             console.error('Polling error:', error);
         }
@@ -220,7 +262,11 @@ export function initModal() {
                 finishedAt: null,
                 lastPolledAt: null,
                 speedPerSecond: 0,
-                progressHistory: []
+                progressHistory: [],
+                charts: null,
+                chartsStatus: 'idle',
+                chartsError: null,
+                chartsFetchedAt: null
             });
             renderSidebar();
             renderMainArea();

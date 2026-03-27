@@ -38,6 +38,10 @@ export const actions = {
                 lastPolledAt: null,
                 speedPerSecond: 0,
                 progressHistory: [],
+                charts: null,
+                chartsStatus: 'idle',
+                chartsError: null,
+                chartsFetchedAt: null,
                 ...patch
             });
         }
