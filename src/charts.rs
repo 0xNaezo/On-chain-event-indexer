@@ -71,9 +71,9 @@ pub async fn native_volume_lamports(pool: &PgPool, address: &str) -> Result<i64>
 }
 
 pub async fn total_fee_lamports(pool: &PgPool, address: &str) -> Result<i64> {
-    let fee: Option<i64> = sqlx::query_scalar(
+    let fee: i64 = sqlx::query_scalar(
         "
-        SELECT COALESCE(SUM(fee), 0)
+        SELECT COALESCE(SUM(fee), 0)::bigint
         FROM transactions
         WHERE owner_address = $1
         ",
@@ -82,5 +82,5 @@ pub async fn total_fee_lamports(pool: &PgPool, address: &str) -> Result<i64> {
     .fetch_one(pool)
     .await?;
 
-    Ok(fee.unwrap_or(0))
+    Ok(fee)
 }
