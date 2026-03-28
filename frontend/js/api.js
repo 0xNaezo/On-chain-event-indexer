@@ -52,12 +52,10 @@ export async function submitAnalyzeRequest(address, filters) {
     return await response.json();
 }
 
-export async function fetchJobInfo(jobId) {
-    const response = await fetch(`http://127.0.0.1:8080/jobs/${jobId}`);
-
+async function parseApiResponse(response, fallbackMessage) {
     if (!response.ok) {
         const contentType = response.headers.get('content-type') || '';
-        let errorMessage = 'Failed to fetch job info';
+        let errorMessage = fallbackMessage;
 
         if (contentType.includes('application/json')) {
             const errorData = await response.json().catch(() => ({}));
@@ -73,4 +71,14 @@ export async function fetchJobInfo(jobId) {
     }
 
     return await response.json();
+}
+
+export async function fetchJobInfo(jobId) {
+    const response = await fetch(`http://127.0.0.1:8080/jobs/${jobId}`);
+    return await parseApiResponse(response, 'Failed to fetch job info');
+}
+
+export async function fetchJobCharts(jobId) {
+    const response = await fetch(`http://127.0.0.1:8080/jobs/${jobId}/charts`);
+    return await parseApiResponse(response, 'Failed to fetch job charts');
 }

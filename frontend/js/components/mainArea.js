@@ -2,6 +2,7 @@ import { state, getters } from '../state.js';
 import { showGlobalToast } from '../utils.js';
 
 let liveMetricsIntervalId = null;
+let txTimelineChart = null;
 
 function formatElapsedTime(startedAt, finishedAt) {
     if (!startedAt) return '-';
@@ -77,9 +78,112 @@ function syncLiveMetricsTimer() {
     }
 }
 
+function destroyTxTimelineChart() {
+    if (txTimelineChart) {
+        txTimelineChart.destroy();
+        txTimelineChart = null;
+    }
+}
+
+function renderTxTimelineChart(chartData) {
+    destroyTxTimelineChart();
+
+    const canvas = document.getElementById('txTimelineChart');
+    if (!canvas || !window.Chart || !Array.isArray(chartData)) {
+        return;
+    }
+
+    txTimelineChart = new window.Chart(canvas, {
+        type: 'bar',
+        data: {
+            labels: chartData.map((_, index) => `${index + 1}`),
+            datasets: [{
+                label: 'tx_time_line',
+                data: chartData,
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false
+        }
+    });
+}
+
+function renderChartsSection(currentItem) {
+    if (currentItem.status !== 'ready') {
+        return `
+            <div class="card" style="padding: 16px 20px;">
+                <div style="font-size: 14px; color: var(--text-secondary);">Charts will appear after status becomes ready.</div>
+            </div>
+        `;
+    }
+
+    if (currentItem.chartsStatus === 'loading') {
+        return `
+            <div class="card" style="padding: 16px 20px;">
+                <div style="font-size: 14px; color: var(--text-secondary);">Loading charts...</div>
+            </div>
+        `;
+    }
+
+    if (currentItem.chartsStatus === 'error') {
+        return `
+            <div class="card" style="padding: 16px 20px;">
+                <div style="font-size: 14px; color: var(--text-secondary);">
+                    Failed to load charts: ${currentItem.chartsError || 'unknown error'}
+                </div>
+            </div>
+        `;
+    }
+
+    if (currentItem.chartsStatus !== 'loaded' || !currentItem.charts) {
+        return `
+            <div class="card" style="padding: 16px 20px;">
+                <div style="font-size: 14px; color: var(--text-secondary);">Charts data is not available yet.</div>
+            </div>
+        `;
+    }
+
+    const charts = currentItem.charts;
+
+    return `
+        <div style="display: flex; flex-direction: column; gap: 16px; margin-top: 24px;">
+            <div class="card" style="padding: 16px 20px;">
+                <div style="margin-bottom: 12px; font-size: 14px; font-weight: 600; color: var(--text-primary);">tx_time_line</div>
+                <div style="height: 280px;">
+                    <canvas id="txTimelineChart"></canvas>
+                </div>
+            </div>
+
+            <div class="card" style="padding: 16px 20px;">
+                <div style="font-size: 28px; font-family: var(--font-mono); color: var(--text-primary);">${charts.count_success_tx ?? 0}</div>
+                <div style="font-size: 14px; color: var(--text-secondary); margin-top: 8px;">count_success_tx</div>
+            </div>
+
+            <div class="card" style="padding: 16px 20px;">
+                <div style="font-size: 28px; font-family: var(--font-mono); color: var(--text-primary);">${charts.count_failed_tx ?? 0}</div>
+                <div style="font-size: 14px; color: var(--text-secondary); margin-top: 8px;">count_failed_tx</div>
+            </div>
+
+            <div class="card" style="padding: 16px 20px;">
+                <div style="font-size: 28px; font-family: var(--font-mono); color: var(--text-primary);">${charts.total_fee_lamports ?? 0}</div>
+                <div style="font-size: 14px; color: var(--text-secondary); margin-top: 8px;">total_fee_lamports</div>
+            </div>
+
+            <div class="card" style="padding: 16px 20px;">
+                <div style="font-size: 28px; font-family: var(--font-mono); color: var(--text-primary);">${charts.native_volume_lamports ?? 0}</div>
+                <div style="font-size: 14px; color: var(--text-secondary); margin-top: 8px;">native_volume_lamports</div>
+            </div>
+        </div>
+    `;
+}
+
 export function renderMainArea() {
     const mainContent = document.getElementById('mainContent');
     if (!mainContent) return;
+
+    destroyTxTimelineChart();
     syncLiveMetricsTimer();
 
     if (!state.activeAddress) {
@@ -121,6 +225,7 @@ export function renderMainArea() {
     const speedLabel = formatSpeed(speedPerSecond, processedTransactions);
     const elapsedLabel = formatElapsedTime(currentItem.indexingStartedAt, currentItem.finishedAt);
     const remainingTimeLabel = formatRemainingTime(remainingTransactions, speedPerSecond);
+    const chartsSection = renderChartsSection(currentItem);
 
     mainContent.innerHTML = `
         <div class="active-header" style="display:flex; flex-direction:column; margin-bottom:32px;">
@@ -211,6 +316,8 @@ export function renderMainArea() {
                 </div>
             </div>
         </div>
+
+        ${chartsSection}
     `;
 
     const copyBtn = document.getElementById('copyBtn');
@@ -220,5 +327,9 @@ export function renderMainArea() {
                 .then(() => showGlobalToast('Address copied!'))
                 .catch(err => console.error('Copy failed', err));
         });
+    }
+
+    if (currentItem.chartsStatus === 'loaded' && currentItem.charts?.tx_time_line) {
+        renderTxTimelineChart(currentItem.charts.tx_time_line);
     }
 }
