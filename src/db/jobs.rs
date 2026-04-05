@@ -5,7 +5,7 @@ use std::time::Instant;
 use tracing::{debug, instrument};
 
 pub struct Jobs {
-    pub pool: PgPool,
+    pool: PgPool,
 }
 
 #[derive(Debug, FromRow)]

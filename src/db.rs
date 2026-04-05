@@ -2,12 +2,13 @@ pub mod jobs;
 pub mod signatures;
 pub mod transactions;
 
-pub use jobs::*;
-pub use signatures::*;
-pub use transactions::*;
+pub use jobs::ClaimedJob;
+use jobs::Jobs;
+use signatures::Signatures;
+use transactions::Transactions;
 
 use anyhow::Result;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Instant;
 use tracing::{info, instrument};
 
@@ -15,6 +16,7 @@ pub struct Database {
     pub jobs: Jobs,
     pub signatures: Signatures,
     pub transactions: Transactions,
+    pub pool: PgPool,
 }
 
 impl Database {
@@ -34,7 +36,8 @@ impl Database {
         Ok(Self {
             jobs: Jobs::new(pool.clone()),
             signatures: Signatures::new(pool.clone()),
-            transactions: Transactions::new(pool),
+            transactions: Transactions::new(pool.clone()),
+            pool,
         })
     }
 }

@@ -8,7 +8,7 @@ use std::time::Instant;
 use tracing::{debug, instrument};
 
 pub struct Signatures {
-    pub pool: PgPool,
+    pool: PgPool,
 }
 
 impl Signatures {
@@ -83,8 +83,8 @@ impl Signatures {
         Ok(updated)
     }
 
-    #[instrument(skip(self, signatures), fields(address = %mask_addr(adress), input_count = signatures.result.len()))]
-    pub async fn write_signatures(&self, signatures: &RpcResponse, adress: &str) -> Result<u64> {
+    #[instrument(skip(self, signatures), fields(address = %mask_addr(address), input_count = signatures.result.len()))]
+    pub async fn write_signatures(&self, signatures: &RpcResponse, address: &str) -> Result<u64> {
         if signatures.result.is_empty() {
             debug!("No signatures to insert");
             return Ok(0);
@@ -99,7 +99,7 @@ impl Signatures {
         let signatures_iter = signatures.result.iter();
 
         query_builder.push_values(signatures_iter, |mut b, signature| {
-            b.push_bind(adress)
+            b.push_bind(address)
                 .push_bind(&signature.signature)
                 .push_bind(signature.block_time);
         });

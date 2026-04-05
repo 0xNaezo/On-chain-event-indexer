@@ -9,7 +9,7 @@ use crate::logging::mask_addr;
 use crate::requests::{TokenTransferChange, TransactionInfo, TransactionResult};
 
 pub struct Transactions {
-    pub pool: PgPool,
+    pool: PgPool,
 }
 
 pub struct SaveStats {
