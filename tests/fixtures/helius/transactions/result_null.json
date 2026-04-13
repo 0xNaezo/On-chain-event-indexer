@@ -1,7 +1,5 @@
 {
   "jsonrpc": "2.0",
   "id": "1",
-  "result": {},
-  "version": 0,
-  "blockTime": 1775977452
+  "result": null
 }
