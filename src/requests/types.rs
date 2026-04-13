@@ -1,3 +1,4 @@
+use anyhow::Result;
 use serde::{Deserialize, de::Deserializer};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -559,5 +560,346 @@ impl AccountKeys {
                 AccountKey::Pubkey(_) => false,
             })
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::error::Category;
+
+    fn parse_transaction_envelope(data: &str) -> Result<RpcEnvelope<Value>> {
+        Ok(serde_json::from_str(data)?)
+    }
+
+    fn extract_transaction_info(response: RpcEnvelope<Value>) -> Result<TransactionInfo> {
+        let result = response.result.unwrap();
+        Ok(serde_json::from_value(result)?)
+    }
+
+    #[test]
+    fn should_deserialize_success_response_when_valid_success_json() -> Result<()> {
+        let data = include_str!("../../tests/fixtures/helius/signatures/success.json");
+        let response: RpcEnvelope<Vec<Signature>> = serde_json::from_str(data)?;
+
+        assert!(response.error.is_none());
+        assert!(response.result.is_some());
+
+        let result = response.result.unwrap();
+
+        assert_eq!(result.len(), 1000);
+
+        let first = &result[0];
+        assert_eq!(
+            first.signature,
+            "2WgqNhsgJnPE2UuR4sTRVugHVqVYLLu2nxb6y2KiUyDHL22mw5VPBeDB5eKyvx8GHSQjKVghSFL8szcSZLZgsv3V"
+        );
+        assert_eq!(first.block_time, Some(1_775_979_983));
+
+        let second = &result[1];
+        assert_eq!(
+            second.signature,
+            "hRrpBWCFK1mRhNXmt8VqRHZPRemU2G7bQRg8C9rVCKW27vDEbkPiXMG3dppo6dTjBDP9L1LAUKndyQB7pbPGGAd"
+        );
+        assert_eq!(second.block_time, Some(1_775_977_386));
+
+        let tx_with_rpc_error_payload = &result[17];
+        assert_eq!(
+            tx_with_rpc_error_payload.signature,
+            "4KAP8oXQsVi6QbfQcWLgjUeLuoU935Hpb4bkYEzPUtrCWnwRwXCvF4mkcQy2BfGBeg3rJfSPzjjTN5hE6xuKw37P"
+        );
+        assert_eq!(tx_with_rpc_error_payload.block_time, Some(1_775_976_858));
+
+        let last = result.last().unwrap();
+        assert_eq!(
+            last.signature,
+            "VPuoe9Hy4rPHio2DDrZyDjz1UPuggpRj1CdRFUFQMUKDr4shyf65xaPM1otFssTssWG6bsnrvALvjudF1erXxG4"
+        );
+        assert_eq!(last.block_time, Some(1_775_928_590));
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_deserialize_empty_result_when_empty_result_json() -> Result<()> {
+        let data = include_str!("../../tests/fixtures/helius/signatures/empty_result.json");
+        let response: RpcEnvelope<Vec<Signature>> = serde_json::from_str(data)?;
+
+        assert!(response.error.is_none());
+        assert_eq!(response.result.unwrap().len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_deserialize_generic_rpc_error_when_rpc_error_generic_json() -> Result<()> {
+        let data = include_str!("../../tests/fixtures/helius/signatures/rpc_error_generic.json");
+        let response: RpcEnvelope<Vec<Signature>> = serde_json::from_str(data)?;
+
+        assert!(response.result.is_none());
+        let rpc_error = response.error.unwrap();
+        assert!(!rpc_error.is_rate_limited());
+
+        assert_eq!(rpc_error.code, i64::from(-32602));
+        assert_eq!(
+            rpc_error.message,
+            String::from("Invalid params: invalid type: integer `123`, expected a string")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_deserialize_rate_limit_error_when_rpc_error_rate_limit_json() -> Result<()> {
+        let data = include_str!("../../tests/fixtures/helius/signatures/rpc_error_rate_limit.json");
+        let response: RpcEnvelope<Vec<Signature>> = serde_json::from_str(data)?;
+
+        assert!(response.result.is_none());
+
+        let rpc_error = response.error.unwrap();
+
+        assert_eq!(rpc_error.code, i64::from(429));
+        assert_eq!(rpc_error.message, String::from("Too Many Requests"));
+
+        assert!(rpc_error.is_rate_limited());
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_return_error_when_deserializing_malformed_json() {
+        let data = include_str!("../../tests/fixtures/helius/signatures/malformed_json.txt");
+        let Err(error) = serde_json::from_str::<RpcEnvelope<Vec<Signature>>>(data) else {
+            panic!("malformed signature fixture must fail to deserialize")
+        };
+
+        assert!(matches!(error.classify(), Category::Syntax | Category::Eof));
+    }
+
+    #[test]
+    fn should_succeed_when_valid_transaction_json_is_provided() -> Result<()> {
+        let data = include_str!("../../tests/fixtures/helius/transactions/success.json");
+        let response = parse_transaction_envelope(data)?;
+        let transaction = extract_transaction_info(response)?;
+
+        assert_eq!(transaction.slot, 412_675_806);
+        assert_eq!(transaction.block_time, 1_775_977_452);
+        assert_eq!(transaction.meta.compute_units_consumed, 161_456);
+        assert_eq!(transaction.meta.fee, 124_000);
+        assert!(transaction.meta.err.is_null());
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_deserialize_transaction_message_shape_from_success_fixture() -> Result<()> {
+        let data = include_str!("../../tests/fixtures/helius/transactions/success.json");
+        let response = parse_transaction_envelope(data)?;
+        let transaction = extract_transaction_info(response)?;
+
+        assert_eq!(transaction.transaction.signatures.len(), 3);
+        assert_eq!(transaction.transaction.message.count_signers(), 3);
+        assert!(!transaction.transaction.message.keys.is_empty());
+        assert!(!transaction.transaction.message.instructions.is_empty());
+        assert_eq!(
+            transaction.transaction.message.pubkeys()[0],
+            "AvdQRq82hfuTLAmFMkkPy2XsTdoNzGmU7mq54vGjGDEZ"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_deserialize_top_level_instructions_from_success_fixture() -> Result<()> {
+        let data = include_str!("../../tests/fixtures/helius/transactions/success.json");
+        let response = parse_transaction_envelope(data)?;
+        let transaction = extract_transaction_info(response)?;
+
+        let first_instruction = &transaction.transaction.message.instructions[0];
+        assert!(first_instruction.parsed.is_none());
+        assert_eq!(
+            first_instruction.program_id.as_deref(),
+            Some("ComputeBudget111111111111111111111111111111")
+        );
+
+        let ata_instruction = &transaction.transaction.message.instructions[2];
+        assert_eq!(
+            ata_instruction.program.as_deref(),
+            Some("spl-associated-token-account")
+        );
+        assert_eq!(
+            ata_instruction.program_id.as_deref(),
+            Some("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+        );
+
+        let parsed = ata_instruction
+            .parsed
+            .as_ref()
+            .expect("ATA instruction must contain parsed payload");
+        assert_eq!(parsed.instruction_type, "createIdempotent");
+        assert_eq!(
+            parsed.info.account.as_deref(),
+            Some("2naDnfYtHQAiUfxcMFsygUXCDCbiqiY79eCwmB7ExTAM")
+        );
+        assert_eq!(
+            parsed.info.mint.as_deref(),
+            Some("So11111111111111111111111111111111111111112")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_deserialize_inner_instructions_and_token_balances_from_success_fixture() -> Result<()>
+    {
+        let data = include_str!("../../tests/fixtures/helius/transactions/success.json");
+        let response = parse_transaction_envelope(data)?;
+        let transaction = extract_transaction_info(response)?;
+
+        assert!(!transaction.meta.inner_instructions.is_empty());
+        assert_eq!(transaction.meta.inner_instructions[0].index, 2);
+        assert_eq!(
+            transaction.meta.inner_instructions[0].instructions[0]
+                .program
+                .as_deref(),
+            Some("spl-token")
+        );
+        assert_eq!(
+            transaction.meta.inner_instructions[0].instructions[0]
+                .parsed
+                .as_ref()
+                .expect("inner instruction must contain parsed payload")
+                .instruction_type,
+            "getAccountDataSize"
+        );
+
+        assert_eq!(transaction.meta.pre_token_balances.len(), 5);
+        assert_eq!(transaction.meta.post_token_balances.len(), 6);
+        assert!(!transaction.meta.pre_token_balances[0].mint.is_empty());
+        assert!(!transaction.meta.pre_token_balances[0].owner.is_empty());
+        assert!(!transaction.meta.post_token_balances[0].mint.is_empty());
+        assert!(!transaction.meta.post_token_balances[0].owner.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_succeed_when_optional_fields_are_missing() -> Result<()> {
+        let data = include_str!(
+            "../../tests/fixtures/helius/transactions/success_missing_optional_fields.json"
+        );
+        let response = parse_transaction_envelope(data)?;
+        let transaction = extract_transaction_info(response)?;
+
+        assert!(transaction.meta.inner_instructions.is_empty());
+        assert!(transaction.transaction.message.header.is_none());
+        assert_eq!(transaction.slot, 412_675_806);
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_preserve_optional_instruction_defaults_when_fields_are_missing() -> Result<()> {
+        let data = include_str!(
+            "../../tests/fixtures/helius/transactions/success_missing_optional_fields.json"
+        );
+        let response = parse_transaction_envelope(data)?;
+        let transaction = extract_transaction_info(response)?;
+
+        match &transaction.transaction.message.keys[3] {
+            AccountKey::Info(info) => assert_eq!(info.signer, None),
+            AccountKey::Pubkey(_) => panic!("expected AccountKey::Info for fixture key"),
+        }
+
+        let ata_instruction = &transaction.transaction.message.instructions[2];
+        assert!(ata_instruction.program.is_none());
+        assert_eq!(
+            ata_instruction.program_id.as_deref(),
+            Some("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+        );
+        assert_eq!(
+            ata_instruction
+                .parsed
+                .as_ref()
+                .expect("ATA instruction must contain parsed payload")
+                .instruction_type,
+            "createIdempotent"
+        );
+
+        let system_instruction = &transaction.transaction.message.instructions[4];
+        assert_eq!(system_instruction.program.as_deref(), Some("system"));
+        assert_eq!(
+            system_instruction.program_id.as_deref(),
+            Some("11111111111111111111111111111111")
+        );
+        assert!(system_instruction.parsed.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_deserialize_generic_rpc_error_for_transaction_envelope() -> Result<()> {
+        let data = include_str!("../../tests/fixtures/helius/signatures/rpc_error_generic.json");
+        let response: RpcEnvelope<Value> = serde_json::from_str(data)?;
+
+        assert!(response.result.is_none());
+        let rpc_error = response.error.unwrap();
+
+        assert_eq!(rpc_error.code, -32602);
+        assert!(!rpc_error.is_rate_limited());
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_treat_null_transaction_result_as_absent_payload() -> Result<()> {
+        let data = include_str!("../../tests/fixtures/helius/transactions/result_null.json");
+        let response = parse_transaction_envelope(data)?;
+
+        assert!(response.result.is_none());
+        assert!(response.error.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_succeed_when_malformed_parsed_instruction_json_is_provided() -> Result<()> {
+        let data = include_str!(
+            "../../tests/fixtures/helius/transactions/malformed_parsed_instruction.json"
+        );
+        let response = parse_transaction_envelope(data)?;
+
+        assert!(response.error.is_none());
+        let transaction = extract_transaction_info(response)?;
+
+        let malformed_instruction = &transaction.transaction.message.instructions[2];
+        assert_eq!(
+            malformed_instruction.program.as_deref(),
+            Some("spl-associated-token-account")
+        );
+        assert!(malformed_instruction.parsed.is_none());
+
+        let next_instruction = &transaction.transaction.message.instructions[3];
+        assert_eq!(
+            next_instruction
+                .parsed
+                .as_ref()
+                .expect("next instruction must still deserialize")
+                .instruction_type,
+            "createIdempotent"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_return_error_when_malformed_transaction_json_is_provided() {
+        let data = include_str!("../../tests/fixtures/helius/transactions/malformed_json.txt");
+        let Err(error) = serde_json::from_str::<RpcEnvelope<Value>>(data) else {
+            panic!("malformed transaction fixture must fail to deserialize")
+        };
+
+        assert!(matches!(error.classify(), Category::Syntax | Category::Eof));
     }
 }
