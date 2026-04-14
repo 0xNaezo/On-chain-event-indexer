@@ -65,8 +65,7 @@ struct RecentSignaturesResult {
 }
 
 pub struct HeliusApi {
-    api: String,
-    url: String,
+    rpc_endpoint: String,
     client: Client,
     rate_limiter: Arc<GlobalRateLimiter>,
     semaphore: Arc<Semaphore>,
@@ -76,7 +75,7 @@ pub struct HeliusApi {
 }
 
 impl HeliusApi {
-    pub fn new(rps: u32, max_concurrent: usize) -> Result<Self> {
+    pub fn new(rps: u32, max_concurrent: usize, rpc_endpoint: String) -> Result<Self> {
         let quota = Quota::per_second(
             std::num::NonZeroU32::new(rps)
                 .ok_or_else(|| anyhow!("RPS не может быть равен нулю"))?,
@@ -87,14 +86,10 @@ impl HeliusApi {
         let rate_limit_backoff = Arc::new(Mutex::new(WorkerBackoff::new(500.0, 10_000.0, 2.0)));
         let rate_limit_until = Arc::new(Mutex::new(None));
         let last_rate_limit_at = Arc::new(Mutex::new(None));
-
-        let api = dotenvy::var("api")?;
         let client = Client::new();
-        let url = String::from("https://mainnet.helius-rpc.com/?api-key=");
 
         Ok(Self {
-            api,
-            url,
+            rpc_endpoint,
             client,
             rate_limiter,
             semaphore,
@@ -518,7 +513,7 @@ impl HeliusApi {
         let _permit = self.acquire_request_slot().await?;
         let response = self
             .client
-            .post(format!("{}{}", self.url, self.api))
+            .post(&self.rpc_endpoint)
             .json(body)
             .send()
             .await?;
