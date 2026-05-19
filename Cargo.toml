@@ -18,11 +18,11 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 tracing-appender = "0.2"
 solana-client = "3.0.0"
-solana-sdk = "3.0.0"
+solana-sdk = "4.0.1"
 solana-transaction-status = "3.0.0"
 solana-account-decoder = "3.0.0"
 clap = { version = "4.6.1", features = ["derive"] }
-config = "0.15.22"
+config = "0.15.23"
 dotenvy = "0.15.7"
 chrono = { version = "0.4.44", features = ["serde"] }
 governor = "0.10.4"
@@ -41,7 +41,7 @@ colored = { version = "3.1.1" }
 futures = "0.3.32"
 rand = "0.10"
 axum = "0.8"
-tower-http = { version = "0.6.8", features = ["cors"] }
+tower-http = { version = "0.6.11", features = ["cors"] }
 nonzero_ext = "0.3"
 
 [lints.clippy]
